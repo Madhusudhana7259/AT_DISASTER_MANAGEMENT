@@ -34,9 +34,14 @@ lap
 # Data handling
 # -------------------------
 pandas
+langchain
+langgraph
+langchain-core
 
 # -------------------------
 # Visualization / Dashboard (later)
 # -------------------------
 streamlit
 flask
+fastapi
+uvicorn[standard]

@@ -2,11 +2,12 @@ import numpy as np
 import cv2
 
 class SceneState:
-    def __init__(self, frame_id, timestamp, objects, optical_flow):
+    def __init__(self, frame_id, timestamp, objects, optical_flow, detections=None):
         self.frame_id = frame_id
         self.timestamp = timestamp
         self.objects = objects
         self.optical_flow = optical_flow
+        self.detections = detections or []
 
         self.crowd_count = sum(
             1 for obj in objects if obj["class"] == "person"
