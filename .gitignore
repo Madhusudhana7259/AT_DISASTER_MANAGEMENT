@@ -2,3 +2,5 @@ enp/
 dataset/
 __pycache__/
 node_modules/
+.env
+data/

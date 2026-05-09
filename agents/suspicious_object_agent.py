@@ -7,11 +7,11 @@ class SuspiciousObjectAgent:
         owner_attach_distance_px=220,
         owner_keep_distance_px=240,
         unattended_distance_px=240,
-        unattended_frames_threshold=12,
+        unattended_frames_threshold=3,
         person_missing_frames_threshold=25,
         reassign_frames_threshold=6,
         stale_bag_frames=180,
-        id_switch_match_distance_px=80,
+        id_switch_match_distance_px=120,
         id_switch_match_frames=20,
         static_motion_threshold_px=8,
         static_frames_threshold=20,
@@ -34,6 +34,8 @@ class SuspiciousObjectAgent:
         self.suspicious_classes = {"backpack", "handbag", "suitcase", "bag"}
         self.person_last_seen = {}
         self.bag_states = {}
+        self.persistent_bag_tracks = {}
+        self.next_persistent_bag_id = 1
 
     @staticmethod
     def _center(bbox):
@@ -83,35 +85,93 @@ class SuspiciousObjectAgent:
             return 0.0
         return inter_area / union
 
-    def _build_bag_candidates(self, scene_state):
-        tracked_bags = [
-            obj for obj in scene_state.objects if obj.get("class") in self.suspicious_classes
+    def _cleanup_stale_persistent_bag_tracks(self, frame_id):
+        stale_ids = [
+            tid
+            for tid, track in self.persistent_bag_tracks.items()
+            if (frame_id - track.get("last_seen_frame", -10**9)) > self.id_switch_match_frames
         ]
-        candidates = [dict(obj) for obj in tracked_bags]
+        for tid in stale_ids:
+            del self.persistent_bag_tracks[tid]
 
+    def _build_bag_candidates(self, scene_state):
+        frame_id = int(scene_state.frame_id)
         detection_bags = [
             det for det in getattr(scene_state, "detections", [])
             if det.get("class") in self.suspicious_classes
         ]
-        frame_id = int(scene_state.frame_id)
-
-        for idx, det in enumerate(detection_bags):
-            dbbox = det["bbox"]
-            overlaps_tracked = any(
-                self._iou(dbbox, tb["bbox"]) >= 0.3 for tb in tracked_bags
-            )
-            if overlaps_tracked:
-                continue
-
-            candidates.append(
+        if detection_bags:
+            raw_bags = [
                 {
-                    "track_id": f"det_{frame_id}_{idx}",
                     "class": det["class"],
-                    "bbox": dbbox,
+                    "bbox": det["bbox"],
+                    "confidence": float(det.get("confidence", 0.0)),
+                }
+                for det in detection_bags
+            ]
+        else:
+            # Fallback when raw detections are temporarily empty.
+            tracked_bags = [
+                obj for obj in scene_state.objects if obj.get("class") in self.suspicious_classes
+            ]
+            raw_bags = [
+                {
+                    "class": obj["class"],
+                    "bbox": obj["bbox"],
+                    "confidence": 1.0,
+                }
+                for obj in tracked_bags
+            ]
+
+        self._cleanup_stale_persistent_bag_tracks(frame_id)
+        assigned = []
+        used_track_ids = set()
+
+        for bag in sorted(raw_bags, key=lambda x: x.get("confidence", 0.0), reverse=True):
+            bag_class = bag["class"]
+            bbox = bag["bbox"]
+            center = self._center(bbox)
+
+            best_id = None
+            best_dist = float("inf")
+            for tid, track in self.persistent_bag_tracks.items():
+                if tid in used_track_ids:
+                    continue
+                if track.get("class") != bag_class:
+                    continue
+                if (frame_id - track.get("last_seen_frame", -10**9)) > self.id_switch_match_frames:
+                    continue
+
+                prev_bbox = track.get("bbox")
+                prev_center = track.get("center")
+                iou = self._iou(bbox, prev_bbox) if prev_bbox is not None else 0.0
+                dist = self._distance(center, prev_center) if prev_center is not None else float("inf")
+
+                if iou >= 0.1 or dist <= self.id_switch_match_distance_px:
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_id = tid
+
+            if best_id is None:
+                best_id = f"bag_{self.next_persistent_bag_id}"
+                self.next_persistent_bag_id += 1
+
+            self.persistent_bag_tracks[best_id] = {
+                "class": bag_class,
+                "bbox": bbox,
+                "center": center,
+                "last_seen_frame": frame_id,
+            }
+            used_track_ids.add(best_id)
+            assigned.append(
+                {
+                    "track_id": best_id,
+                    "class": bag_class,
+                    "bbox": bbox,
                 }
             )
 
-        return candidates
+        return assigned
 
     def _nearest_person(self, bag_center, person_centers_by_id, exclude_id=None):
         candidates = [
@@ -215,12 +275,8 @@ class SuspiciousObjectAgent:
             raw_bag_id = bag["track_id"]
             bag_class = bag["class"]
             bcenter = self._center(bag["bbox"])
-            bag_id = self._match_id_switched_bag(
-                bag_id=raw_bag_id,
-                bag_class=bag_class,
-                bag_center=bcenter,
-                frame_id=frame_id,
-            )
+            bag_id = raw_bag_id
+            marked_unattended = False
             state = self._get_bag_state(bag_id, frame_id)
             state["last_seen_frame"] = frame_id
             prev_center = state["last_center"]
@@ -245,6 +301,15 @@ class SuspiciousObjectAgent:
             else:
                 state["no_person_frames"] = 0
 
+            # Demo-safe fallback: sustained stationary bags are suspicious even in crowded scenes.
+            if state["static_frames"] >= self.static_frames_threshold:
+                suspicious_count += 1
+                unattended_bag_ids.append(bag_id)
+                unattended_bboxes.append(
+                    {"track_id": bag_id, "class": bag_class, "bbox": bag["bbox"]}
+                )
+                marked_unattended = True
+
             # No owner yet: attach initial owner only if someone is close enough.
             if owner_id is None:
                 nearest_pid, nearest_dist = nearest_any_pid, nearest_any_dist
@@ -255,16 +320,18 @@ class SuspiciousObjectAgent:
                     state["candidate_owner_id"] = None
                     state["candidate_owner_frames"] = 0
                 # Fallback unattended logic for cases where owner never got a stable ID.
-                if (
-                    state["static_frames"] >= self.static_frames_threshold
-                    and state["no_person_frames"] >= self.no_person_frames_threshold
-                ):
-                    suspicious_count += 1
-                    unattended_bag_ids.append(bag_id)
-                    if isinstance(bag_id, str) and bag_id.startswith("det_"):
+                fallback_unattended = state["static_frames"] >= self.static_frames_threshold
+                no_person_unattended = (
+                    state["no_person_frames"] >= self.no_person_frames_threshold
+                )
+                if fallback_unattended or no_person_unattended:
+                    if not marked_unattended:
+                        suspicious_count += 1
+                        unattended_bag_ids.append(bag_id)
                         unattended_bboxes.append(
                             {"track_id": bag_id, "class": bag_class, "bbox": bag["bbox"]}
                         )
+                        marked_unattended = True
                 debug_bags.append(
                     {
                         "bag_id": bag_id,
@@ -277,11 +344,11 @@ class SuspiciousObjectAgent:
                         "static_frames": int(state.get("static_frames", 0)),
                         "no_person_frames": int(state.get("no_person_frames", 0)),
                         "unattended_frames": int(state.get("unattended_frames", 0)),
-                        "owner_based_unattended": False,
-                        "fallback_unattended": bool(
+                        "stationary_unattended": bool(
                             state["static_frames"] >= self.static_frames_threshold
-                            and state["no_person_frames"] >= self.no_person_frames_threshold
                         ),
+                        "owner_based_unattended": False,
+                        "fallback_unattended": bool(fallback_unattended),
                     }
                 )
                 continue
@@ -298,14 +365,17 @@ class SuspiciousObjectAgent:
             owner_last_seen = self.person_last_seen.get(owner_id, -10**9)
             owner_recently_seen = (frame_id - owner_last_seen) <= self.person_missing_frames_threshold
 
-            # Strong guard: if bag is currently close to any person, treat as attended.
-            # This prevents false unattended alerts for carried/nearby bags when owner_id drifts.
-            if nearest_any_pid is not None and nearest_any_dist <= self.owner_keep_distance_px:
+            # Treat as attended only when someone is effectively carrying/picking up the bag.
+            # Do not clear unattended state just because random nearby people are in the scene.
+            if (
+                nearest_any_pid is not None
+                and nearest_any_dist <= self.carried_distance_px
+                and state["static_frames"] <= 2
+            ):
                 state["unattended_frames"] = 0
-                if nearest_any_dist <= self.carried_distance_px:
-                    state["owner_id"] = nearest_any_pid
-                    state["candidate_owner_id"] = None
-                    state["candidate_owner_frames"] = 0
+                state["owner_id"] = nearest_any_pid
+                state["candidate_owner_id"] = None
+                state["candidate_owner_frames"] = 0
                 continue
 
             if owner_bbox is not None and owner_dist <= self.owner_keep_distance_px:
@@ -321,7 +391,15 @@ class SuspiciousObjectAgent:
                 person_bboxes_by_id=person_bboxes_by_id,
                 exclude_id=owner_id,
             )
-            if nearest_pid is not None and nearest_dist <= self.owner_attach_distance_px:
+            can_reassign = (
+                nearest_pid is not None
+                and nearest_dist <= self.owner_attach_distance_px
+                and (
+                    nearest_dist <= self.carried_distance_px
+                    or (owner_recently_seen and state["unattended_frames"] == 0)
+                )
+            )
+            if can_reassign:
                 if state["candidate_owner_id"] == nearest_pid:
                     state["candidate_owner_frames"] += 1
                 else:
@@ -351,12 +429,13 @@ class SuspiciousObjectAgent:
                 and state["no_person_frames"] >= self.no_person_frames_threshold
             )
             if owner_based_unattended or fallback_unattended:
-                suspicious_count += 1
-                unattended_bag_ids.append(bag_id)
-                if isinstance(bag_id, str) and bag_id.startswith("det_"):
+                if not marked_unattended:
+                    suspicious_count += 1
+                    unattended_bag_ids.append(bag_id)
                     unattended_bboxes.append(
                         {"track_id": bag_id, "class": bag_class, "bbox": bag["bbox"]}
                     )
+                    marked_unattended = True
 
             debug_bags.append(
                 {
@@ -370,6 +449,9 @@ class SuspiciousObjectAgent:
                     "static_frames": int(state.get("static_frames", 0)),
                     "no_person_frames": int(state.get("no_person_frames", 0)),
                     "unattended_frames": int(state.get("unattended_frames", 0)),
+                    "stationary_unattended": bool(
+                        state["static_frames"] >= self.static_frames_threshold
+                    ),
                     "owner_based_unattended": bool(owner_based_unattended),
                     "fallback_unattended": bool(fallback_unattended),
                 }
